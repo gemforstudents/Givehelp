@@ -2,7 +2,7 @@ import logging
 import os
 import random
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from telegram import Update
 from telegram.error import TelegramError
@@ -11,6 +11,12 @@ from telegram.ext import Application, ApplicationBuilder, CommandHandler, Contex
 DB_PATH = os.getenv("DB_PATH", "giveaway.db")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
+REQUIRED_CHANNELS = [
+    channel.strip()
+    for channel in os.getenv("REQUIRED_CHANNELS", "").split(",")
+    if channel.strip()
+]
+TEMP_BAN_HOURS = int(os.getenv("TEMP_BAN_HOURS", "24"))
 
 REWARD_TYPE_ALIASES = {
     "mailpass": "mailpass",
@@ -32,6 +38,31 @@ LOGGER = logging.getLogger(__name__)
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def utc_after(hours: int) -> str:
+    safe_hours = max(hours, 0)
+    return (
+        datetime.now(timezone.utc) + timedelta(hours=safe_hours)
+    ).isoformat(timespec="seconds")
+
+
+def parse_timestamp(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def normalize_channel_id(value: str) -> str | int:
+    trimmed = value.strip()
+    if trimmed.lstrip("-").isdigit():
+        return int(trimmed)
+    if trimmed.startswith("@"):
+        return trimmed
+    return f"@{trimmed}"
 
 
 def get_conn() -> sqlite3.Connection:
@@ -91,6 +122,18 @@ def init_db() -> None:
                 joined_at TEXT NOT NULL,
                 PRIMARY KEY (giveaway_id, user_id),
                 FOREIGN KEY (giveaway_id) REFERENCES giveaways(id) ON DELETE CASCADE
+            );
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_status (
+                user_id INTEGER PRIMARY KEY,
+                strikes INTEGER NOT NULL DEFAULT 0,
+                temp_ban_until TEXT,
+                perm_ban INTEGER NOT NULL DEFAULT 0,
+                ever_member INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL
             );
             """
         )
@@ -253,11 +296,205 @@ def user_has_redeemed(giveaway_id: int, user_id: int) -> bool:
     return row is not None
 
 
+def get_or_create_user_status(user_id: int) -> sqlite3.Row:
+    with get_conn() as conn:
+        row = conn.execute(
+            """
+            SELECT user_id, strikes, temp_ban_until, perm_ban, ever_member
+            FROM user_status
+            WHERE user_id = ?;
+            """,
+            (user_id,),
+        ).fetchone()
+        if row:
+            return row
+        conn.execute(
+            """
+            INSERT INTO user_status
+                (user_id, strikes, temp_ban_until, perm_ban, ever_member, updated_at)
+            VALUES (?, 0, NULL, 0, 0, ?);
+            """,
+            (user_id, utc_now()),
+        )
+        return conn.execute(
+            """
+            SELECT user_id, strikes, temp_ban_until, perm_ban, ever_member
+            FROM user_status
+            WHERE user_id = ?;
+            """,
+            (user_id,),
+        ).fetchone()
+
+
+def mark_user_member(user_id: int) -> None:
+    with get_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO user_status
+                (user_id, strikes, temp_ban_until, perm_ban, ever_member, updated_at)
+            VALUES (?, 0, NULL, 0, 1, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                ever_member = 1,
+                updated_at = excluded.updated_at;
+            """,
+            (user_id, utc_now()),
+        )
+
+
+def record_violation(user_id: int) -> sqlite3.Row:
+    current = get_or_create_user_status(user_id)
+    strikes = (current["strikes"] or 0) + 1
+    perm_ban = 1 if strikes >= 2 else 0
+    temp_ban_until = None if perm_ban else utc_after(TEMP_BAN_HOURS)
+    with get_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO user_status
+                (user_id, strikes, temp_ban_until, perm_ban, ever_member, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                strikes = excluded.strikes,
+                temp_ban_until = excluded.temp_ban_until,
+                perm_ban = excluded.perm_ban,
+                ever_member = excluded.ever_member,
+                updated_at = excluded.updated_at;
+            """,
+            (
+                user_id,
+                strikes,
+                temp_ban_until,
+                perm_ban,
+                current["ever_member"] or 0,
+                utc_now(),
+            ),
+        )
+        return conn.execute(
+            """
+            SELECT user_id, strikes, temp_ban_until, perm_ban, ever_member
+            FROM user_status
+            WHERE user_id = ?;
+            """,
+            (user_id,),
+        ).fetchone()
+
+
+def clear_ban(user_id: int) -> None:
+    with get_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO user_status
+                (user_id, strikes, temp_ban_until, perm_ban, ever_member, updated_at)
+            VALUES (?, 0, NULL, 0, 0, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                strikes = 0,
+                temp_ban_until = NULL,
+                perm_ban = 0,
+                updated_at = excluded.updated_at;
+            """,
+            (user_id, utc_now()),
+        )
+
+
+def temp_ban_active(row: sqlite3.Row) -> bool:
+    ban_until = parse_timestamp(row["temp_ban_until"])
+    return ban_until is not None and ban_until > datetime.now(timezone.utc)
+
+
 def require_admin(update: Update) -> bool:
     user = update.effective_user
     if user is None:
         return False
     return is_admin(user.id)
+
+
+def format_required_channels(channels: list[str]) -> str:
+    if not channels:
+        return "the required channel"
+    display = ", ".join(channels)
+    return display
+
+
+async def is_member_of_channel(
+    context: ContextTypes.DEFAULT_TYPE, user_id: int, channel: str
+) -> bool:
+    try:
+        member = await context.bot.get_chat_member(
+            chat_id=normalize_channel_id(channel),
+            user_id=user_id,
+        )
+    except TelegramError:
+        LOGGER.warning("Failed to check channel %s for user %s", channel, user_id)
+        return False
+    status = member.status
+    if status in {"left", "kicked"}:
+        return False
+    if status == "restricted" and not getattr(member, "is_member", False):
+        return False
+    return True
+
+
+async def check_required_channels(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> tuple[bool, list[str]]:
+    if not REQUIRED_CHANNELS:
+        return True, []
+    user = update.effective_user
+    if user is None:
+        return False, REQUIRED_CHANNELS
+    missing: list[str] = []
+    for channel in REQUIRED_CHANNELS:
+        is_member = await is_member_of_channel(context, user.id, channel)
+        if not is_member:
+            missing.append(channel)
+    return len(missing) == 0, missing
+
+
+async def enforce_access(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> bool:
+    user = update.effective_user
+    if user is None:
+        return False
+    if not REQUIRED_CHANNELS:
+        return True
+    if is_admin(user.id):
+        return True
+    status = get_or_create_user_status(user.id)
+    if status["perm_ban"]:
+        await update.message.reply_text(
+            "You are permanently banned from using this bot. "
+            "Contact an admin to request unban."
+        )
+        return False
+    if status["temp_ban_until"] and temp_ban_active(status):
+        await update.message.reply_text(
+            "You are temporarily banned for leaving required channels. "
+            f"Try again after {status['temp_ban_until']} UTC."
+        )
+        return False
+    is_member, missing = await check_required_channels(update, context)
+    if is_member:
+        mark_user_member(user.id)
+        return True
+    if status["ever_member"]:
+        updated = record_violation(user.id)
+        if updated["perm_ban"]:
+            await update.message.reply_text(
+                "You left required channels too many times and are now "
+                "permanently banned. Contact an admin to request unban."
+            )
+            return False
+        await update.message.reply_text(
+            "You left required channels and are temporarily banned. "
+            f"Try again after {updated['temp_ban_until']} UTC. "
+            f"Rejoin: {format_required_channels(missing)}"
+        )
+        return False
+    await update.message.reply_text(
+        "Please join the required channel(s) to use this bot: "
+        f"{format_required_channels(missing)}"
+    )
+    return False
 
 
 def giveaway_overview_row(row: sqlite3.Row) -> str:
@@ -283,6 +520,8 @@ def fetch_giveaway(giveaway_id: int) -> sqlite3.Row | None:
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await enforce_access(update, context):
+        return
     user = update.effective_user
     name = user.full_name if user else "there"
     await update.message.reply_text(
@@ -292,6 +531,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await enforce_access(update, context):
+        return
     await update.message.reply_text(
         "Giveaway bot commands:\n"
         "/help - Show this help message\n"
@@ -310,12 +551,15 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/addcode <id> <code>\n"
         "/addcodes <id> <code1,code2,...>\n"
         "/codes <id>\n"
+        "/unban <user_id> (or reply to a user)\n"
         "/addadmin <user_id> (or reply to a user)\n"
         "/removeadmin <user_id> (or reply to a user)"
     )
 
 
 async def admins_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await enforce_access(update, context):
+        return
     with get_conn() as conn:
         rows = conn.execute(
             "SELECT user_id, added_by, added_at FROM admins ORDER BY added_at ASC;"
@@ -341,6 +585,8 @@ def extract_target_user_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 async def add_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await enforce_access(update, context):
+        return
     if not require_admin(update):
         await update.message.reply_text("Only admins can add other admins.")
         return
@@ -365,6 +611,8 @@ async def add_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def remove_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await enforce_access(update, context):
+        return
     if not require_admin(update):
         await update.message.reply_text("Only admins can remove admins.")
         return
@@ -389,6 +637,8 @@ async def remove_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def create_giveaway(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await enforce_access(update, context):
+        return
     if not require_admin(update):
         await update.message.reply_text("Only admins can create giveaways.")
         return
@@ -420,6 +670,8 @@ async def create_giveaway(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def list_giveaways(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await enforce_access(update, context):
+        return
     with get_conn() as conn:
         rows = conn.execute(
             """
@@ -438,6 +690,8 @@ async def list_giveaways(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def giveaway_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await enforce_access(update, context):
+        return
     giveaway_id = parse_giveaway_id(context.args)
     if giveaway_id is None:
         await update.message.reply_text("Usage: /giveaway <id>")
@@ -485,6 +739,8 @@ async def giveaway_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def join_giveaway(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await enforce_access(update, context):
+        return
     giveaway_id = parse_giveaway_id(context.args)
     if giveaway_id is None:
         await update.message.reply_text("Usage: /join <id>")
@@ -518,6 +774,8 @@ async def join_giveaway(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def close_giveaway(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await enforce_access(update, context):
+        return
     if not require_admin(update):
         await update.message.reply_text("Only admins can close giveaways.")
         return
@@ -548,6 +806,8 @@ async def close_giveaway(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def set_reward(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await enforce_access(update, context):
+        return
     if not require_admin(update):
         await update.message.reply_text("Only admins can set rewards.")
         return
@@ -594,6 +854,8 @@ async def set_reward(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def add_code(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await enforce_access(update, context):
+        return
     if not require_admin(update):
         await update.message.reply_text("Only admins can add redeem codes.")
         return
@@ -627,6 +889,8 @@ async def add_code(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def add_codes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await enforce_access(update, context):
+        return
     if not require_admin(update):
         await update.message.reply_text("Only admins can add redeem codes.")
         return
@@ -663,6 +927,8 @@ async def add_codes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def codes_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await enforce_access(update, context):
+        return
     if not require_admin(update):
         await update.message.reply_text("Only admins can view redeem codes.")
         return
@@ -686,6 +952,8 @@ async def codes_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def reward_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await enforce_access(update, context):
+        return
     if not require_admin(update):
         await update.message.reply_text("Only admins can view rewards.")
         return
@@ -711,7 +979,25 @@ async def reward_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await update.message.reply_text("\n".join(lines))
 
 
+async def unban_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await enforce_access(update, context):
+        return
+    if not require_admin(update):
+        await update.message.reply_text("Only admins can unban users.")
+        return
+    target_id = extract_target_user_id(update, context)
+    if target_id is None:
+        await update.message.reply_text(
+            "Provide a user id or reply to a user to unban."
+        )
+        return
+    clear_ban(target_id)
+    await update.message.reply_text(f"User {target_id} has been unbanned.")
+
+
 async def redeem_code(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await enforce_access(update, context):
+        return
     parsed = parse_redeem_args(context.args)
     if parsed is None:
         await update.message.reply_text("Usage: /redeem <id> <code>")
@@ -777,6 +1063,8 @@ async def redeem_code(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 async def claim_reward(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await enforce_access(update, context):
+        return
     giveaway_id = parse_giveaway_id(context.args)
     if giveaway_id is None:
         await update.message.reply_text("Usage: /claim <id>")
@@ -839,6 +1127,8 @@ async def send_reward_message(
 
 
 async def pick_winner(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await enforce_access(update, context):
+        return
     if not require_admin(update):
         await update.message.reply_text("Only admins can pick winners.")
         return
@@ -916,6 +1206,7 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("addcode", add_code))
     application.add_handler(CommandHandler("addcodes", add_codes))
     application.add_handler(CommandHandler("codes", codes_status))
+    application.add_handler(CommandHandler("unban", unban_user))
     application.add_handler(CommandHandler("winner", pick_winner))
     application.add_error_handler(error_handler)
     return application

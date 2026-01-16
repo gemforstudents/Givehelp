@@ -28,6 +28,8 @@ giveaways while trusted admins can add other admins.
    - `export BOT_TOKEN="your_bot_token"`
    - `export OWNER_ID="123456789"`
    - `export DB_PATH="giveaway.db"`
+   - `export REQUIRED_CHANNELS="@ownerchannel,-1001234567890"`
+   - `export TEMP_BAN_HOURS="24"`
 4. Start the bot:
    - `python bot.py`
 
@@ -50,6 +52,7 @@ Admin only:
 - `/addcode <id> <code>`
 - `/addcodes <id> <code1,code2,...>`
 - `/codes <id>`
+- `/unban <user_id>` (or reply to a user)
 - `/addadmin <user_id>` (or reply to a user)
 - `/removeadmin <user_id>` (or reply to a user)
 
@@ -57,3 +60,6 @@ Admin only:
 - The owner id provided in `OWNER_ID` is automatically an admin.
 - The database file is created in the working directory (default: `giveaway.db`).
 - Rewards and redeem codes are stored in plaintext in SQLite, so keep access restricted.
+- Users must remain in the required channel(s). Leaving triggers a temporary ban,
+  and repeat violations cause a permanent ban until an admin uses `/unban`.
+- For private channels, add the bot to the channel and allow it to read members.
