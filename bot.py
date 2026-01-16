@@ -94,6 +94,20 @@ def init_db() -> None:
             );
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS redeem_codes (
+                giveaway_id INTEGER NOT NULL,
+                code TEXT NOT NULL,
+                added_by INTEGER NOT NULL,
+                added_at TEXT NOT NULL,
+                claimed_by INTEGER,
+                claimed_at TEXT,
+                PRIMARY KEY (giveaway_id, code),
+                FOREIGN KEY (giveaway_id) REFERENCES giveaways(id) ON DELETE CASCADE
+            );
+            """
+        )
         ensure_column(conn, "giveaways", "reward_type", "TEXT")
         ensure_column(conn, "giveaways", "reward_value", "TEXT")
         ensure_column(conn, "giveaways", "reward_set_by", "INTEGER")
@@ -158,6 +172,44 @@ def parse_reward_args(args: list[str]) -> tuple[int, str, str] | None:
     return giveaway_id, reward_type, reward_value
 
 
+def parse_redeem_args(args: list[str]) -> tuple[int, str] | None:
+    if len(args) < 2:
+        return None
+    giveaway_id = parse_user_id(args[0])
+    if giveaway_id is None:
+        return None
+    code = " ".join(args[1:]).strip()
+    if not code:
+        return None
+    return giveaway_id, code
+
+
+def dedupe_values(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        if value and value not in seen:
+            seen.add(value)
+            result.append(value)
+    return result
+
+
+def parse_codes_payload(args: list[str]) -> tuple[int, list[str]] | None:
+    if len(args) < 2:
+        return None
+    giveaway_id = parse_user_id(args[0])
+    if giveaway_id is None:
+        return None
+    payload = " ".join(args[1:]).strip()
+    if not payload:
+        return None
+    raw_codes = [code.strip() for code in payload.split(",")]
+    codes = dedupe_values([code for code in raw_codes if code])
+    if not codes:
+        return None
+    return giveaway_id, codes
+
+
 def reward_label(reward_type: str | None) -> str:
     if reward_type == "mailpass":
         return "Mail:pass"
@@ -168,6 +220,37 @@ def reward_label(reward_type: str | None) -> str:
 
 def reward_description(row: sqlite3.Row) -> str:
     return f"{reward_label(row['reward_type'])}: {row['reward_value']}"
+
+
+def fetch_redeem_stats(giveaway_id: int) -> tuple[int, int]:
+    with get_conn() as conn:
+        row = conn.execute(
+            """
+            SELECT COUNT(*) AS total,
+                   SUM(CASE WHEN claimed_by IS NOT NULL THEN 1 ELSE 0 END)
+                       AS claimed
+            FROM redeem_codes
+            WHERE giveaway_id = ?;
+            """,
+            (giveaway_id,),
+        ).fetchone()
+    total = row["total"] or 0
+    claimed = row["claimed"] or 0
+    return total, claimed
+
+
+def user_has_redeemed(giveaway_id: int, user_id: int) -> bool:
+    with get_conn() as conn:
+        row = conn.execute(
+            """
+            SELECT 1
+            FROM redeem_codes
+            WHERE giveaway_id = ? AND claimed_by = ?
+            LIMIT 1;
+            """,
+            (giveaway_id, user_id),
+        ).fetchone()
+    return row is not None
 
 
 def require_admin(update: Update) -> bool:
@@ -216,6 +299,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/giveaway <id> - View giveaway details\n"
         "/join <id> - Join an open giveaway\n"
         "/claim <id> - Claim reward if you won\n"
+        "/redeem <id> <code> - Redeem a code for a reward\n"
         "/admins - List current admins\n"
         "\nAdmin commands:\n"
         "/creategiveaway Title | Description\n"
@@ -223,6 +307,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/winner <id> [reroll]\n"
         "/setreward <id> <mailpass|redeemcode|custom> <value>\n"
         "/reward <id>\n"
+        "/addcode <id> <code>\n"
+        "/addcodes <id> <code1,code2,...>\n"
+        "/codes <id>\n"
         "/addadmin <user_id> (or reply to a user)\n"
         "/removeadmin <user_id> (or reply to a user)"
     )
@@ -366,6 +453,7 @@ async def giveaway_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     status = row["status"].upper()
     winner = str(row["winner_id"]) if row["winner_id"] else "Not selected"
     description = row["description"] or "No description."
+    redeem_total, redeem_claimed = fetch_redeem_stats(giveaway_id)
     if row["reward_value"]:
         if is_admin_user:
             reward_line = f"Reward: {reward_description(row)}"
@@ -373,12 +461,22 @@ async def giveaway_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             reward_line = "Reward: Set (ask admin)"
     else:
         reward_line = "Reward: Not set"
+    if redeem_total:
+        if is_admin_user:
+            redeem_line = (
+                f"Redeem codes: {redeem_total} total, {redeem_claimed} claimed"
+            )
+        else:
+            redeem_line = "Redeem codes: Required"
+    else:
+        redeem_line = "Redeem codes: None"
     response = (
         f"Giveaway #{row['id']} - {row['title']}\n"
         f"Status: {status}\n"
         f"Participants: {row['participants']}\n"
         f"Winner: {winner}\n"
         f"{reward_line}\n"
+        f"{redeem_line}\n"
         f"Description: {description}"
     )
     if is_winner_user and row["reward_value"]:
@@ -495,6 +593,98 @@ async def set_reward(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     )
 
 
+async def add_code(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not require_admin(update):
+        await update.message.reply_text("Only admins can add redeem codes.")
+        return
+    parsed = parse_redeem_args(context.args)
+    if parsed is None:
+        await update.message.reply_text("Usage: /addcode <id> <code>")
+        return
+    giveaway_id, code = parsed
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT id FROM giveaways WHERE id = ?;",
+            (giveaway_id,),
+        ).fetchone()
+        if row is None:
+            await update.message.reply_text("Giveaway not found.")
+            return
+        cursor = conn.execute(
+            """
+            INSERT OR IGNORE INTO redeem_codes
+                (giveaway_id, code, added_by, added_at)
+            VALUES (?, ?, ?, ?);
+            """,
+            (giveaway_id, code, update.effective_user.id, utc_now()),
+        )
+    if cursor.rowcount == 0:
+        await update.message.reply_text("That code already exists.")
+        return
+    await update.message.reply_text(
+        f"Redeem code added for giveaway #{giveaway_id}."
+    )
+
+
+async def add_codes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not require_admin(update):
+        await update.message.reply_text("Only admins can add redeem codes.")
+        return
+    parsed = parse_codes_payload(context.args)
+    if parsed is None:
+        await update.message.reply_text(
+            "Usage: /addcodes <id> <code1,code2,...>"
+        )
+        return
+    giveaway_id, codes = parsed
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT id FROM giveaways WHERE id = ?;",
+            (giveaway_id,),
+        ).fetchone()
+        if row is None:
+            await update.message.reply_text("Giveaway not found.")
+            return
+        added = 0
+        for code in codes:
+            cursor = conn.execute(
+                """
+                INSERT OR IGNORE INTO redeem_codes
+                    (giveaway_id, code, added_by, added_at)
+                VALUES (?, ?, ?, ?);
+                """,
+                (giveaway_id, code, update.effective_user.id, utc_now()),
+            )
+            if cursor.rowcount:
+                added += 1
+    await update.message.reply_text(
+        f"Added {added} of {len(codes)} redeem codes to giveaway #{giveaway_id}."
+    )
+
+
+async def codes_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not require_admin(update):
+        await update.message.reply_text("Only admins can view redeem codes.")
+        return
+    giveaway_id = parse_giveaway_id(context.args)
+    if giveaway_id is None:
+        await update.message.reply_text("Usage: /codes <id>")
+        return
+    row = fetch_giveaway(giveaway_id)
+    if row is None:
+        await update.message.reply_text("Giveaway not found.")
+        return
+    total, claimed = fetch_redeem_stats(giveaway_id)
+    if total == 0:
+        await update.message.reply_text("No redeem codes added yet.")
+        return
+    available = total - claimed
+    await update.message.reply_text(
+        f"Redeem codes for giveaway #{giveaway_id}: "
+        f"{total} total, {claimed} claimed, {available} available."
+    )
+
+
 async def reward_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not require_admin(update):
         await update.message.reply_text("Only admins can view rewards.")
@@ -521,6 +711,71 @@ async def reward_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await update.message.reply_text("\n".join(lines))
 
 
+async def redeem_code(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    parsed = parse_redeem_args(context.args)
+    if parsed is None:
+        await update.message.reply_text("Usage: /redeem <id> <code>")
+        return
+    giveaway_id, code = parsed
+    row = fetch_giveaway(giveaway_id)
+    if row is None:
+        await update.message.reply_text("Giveaway not found.")
+        return
+    if not row["reward_value"]:
+        await update.message.reply_text("Reward not set yet.")
+        return
+    user = update.effective_user
+    if user is None:
+        await update.message.reply_text("Could not identify user.")
+        return
+    if user_has_redeemed(giveaway_id, user.id):
+        await update.message.reply_text(
+            "You already redeemed a code for this giveaway."
+        )
+        return
+    with get_conn() as conn:
+        code_row = conn.execute(
+            """
+            SELECT claimed_by
+            FROM redeem_codes
+            WHERE giveaway_id = ? AND code = ?;
+            """,
+            (giveaway_id, code),
+        ).fetchone()
+        if code_row is None:
+            await update.message.reply_text("Invalid redeem code.")
+            return
+        if code_row["claimed_by"]:
+            await update.message.reply_text("This redeem code is already used.")
+            return
+        conn.execute(
+            """
+            UPDATE redeem_codes
+            SET claimed_by = ?, claimed_at = ?
+            WHERE giveaway_id = ? AND code = ?;
+            """,
+            (user.id, utc_now(), giveaway_id, code),
+        )
+    chat = update.effective_chat
+    is_private = chat is not None and chat.type == "private"
+    if is_private:
+        await update.message.reply_text(
+            f"Reward for giveaway #{row['id']} - {row['title']}:\n"
+            f"{reward_description(row)}"
+        )
+        return
+    sent = await send_reward_message(context, user.id, row)
+    if sent:
+        await update.message.reply_text(
+            "Redeem successful. I sent your reward in a private message."
+        )
+    else:
+        await update.message.reply_text(
+            "Redeem successful, but I could not DM you. "
+            "Start the bot in private chat and use /claim."
+        )
+
+
 async def claim_reward(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     giveaway_id = parse_giveaway_id(context.args)
     if giveaway_id is None:
@@ -534,11 +789,15 @@ async def claim_reward(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if user is None:
         await update.message.reply_text("Could not identify user.")
         return
-    if row["winner_id"] is None:
+    has_redeemed = user_has_redeemed(giveaway_id, user.id)
+    if row["winner_id"] is None and not has_redeemed:
         await update.message.reply_text("Winner not selected yet.")
         return
-    if row["winner_id"] != user.id:
-        await update.message.reply_text("Only the winner can claim this reward.")
+    is_winner = row["winner_id"] == user.id if row["winner_id"] else False
+    if not (is_winner or has_redeemed):
+        await update.message.reply_text(
+            "Only the winner or a redeemed-code user can claim this reward."
+        )
         return
     if not row["reward_value"]:
         await update.message.reply_text("Reward not set yet.")
@@ -649,10 +908,14 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("listgiveaways", list_giveaways))
     application.add_handler(CommandHandler("giveaway", giveaway_info))
     application.add_handler(CommandHandler("join", join_giveaway))
+    application.add_handler(CommandHandler("redeem", redeem_code))
     application.add_handler(CommandHandler("claim", claim_reward))
     application.add_handler(CommandHandler("closegiveaway", close_giveaway))
     application.add_handler(CommandHandler("setreward", set_reward))
     application.add_handler(CommandHandler("reward", reward_command))
+    application.add_handler(CommandHandler("addcode", add_code))
+    application.add_handler(CommandHandler("addcodes", add_codes))
+    application.add_handler(CommandHandler("codes", codes_status))
     application.add_handler(CommandHandler("winner", pick_winner))
     application.add_error_handler(error_handler)
     return application

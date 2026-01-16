@@ -9,6 +9,7 @@ giveaways while trusted admins can add other admins.
 - Participants join with a single command
 - Random winner selection with optional reroll
 - Reward support for redeem codes and mail:pass credentials
+- Redeem codes that unlock the stored reward
 - SQLite persistence for admins, giveaways, and entries
 
 ## Requirements
@@ -37,6 +38,7 @@ General:
 - `/giveaway <id>` - Giveaway details
 - `/join <id>` - Join a giveaway
 - `/claim <id>` - Claim reward if you won
+- `/redeem <id> <code>` - Redeem a code for reward
 - `/admins` - List admins
 
 Admin only:
@@ -45,10 +47,13 @@ Admin only:
 - `/winner <id> [reroll]`
 - `/setreward <id> <mailpass|redeemcode|custom> <value>`
 - `/reward <id>`
+- `/addcode <id> <code>`
+- `/addcodes <id> <code1,code2,...>`
+- `/codes <id>`
 - `/addadmin <user_id>` (or reply to a user)
 - `/removeadmin <user_id>` (or reply to a user)
 
 ## Notes
 - The owner id provided in `OWNER_ID` is automatically an admin.
 - The database file is created in the working directory (default: `giveaway.db`).
-- Rewards are stored in plaintext in SQLite, so keep access restricted.
+- Rewards and redeem codes are stored in plaintext in SQLite, so keep access restricted.
