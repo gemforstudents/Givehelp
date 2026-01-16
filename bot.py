@@ -5,11 +5,23 @@ import sqlite3
 from datetime import datetime, timezone
 
 from telegram import Update
+from telegram.error import TelegramError
 from telegram.ext import Application, ApplicationBuilder, CommandHandler, ContextTypes
 
 DB_PATH = os.getenv("DB_PATH", "giveaway.db")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
+
+REWARD_TYPE_ALIASES = {
+    "mailpass": "mailpass",
+    "mail:pass": "mailpass",
+    "emailpass": "mailpass",
+    "redeemcode": "redeemcode",
+    "redeem": "redeemcode",
+    "code": "redeemcode",
+    "custom": "custom",
+    "text": "custom",
+}
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -27,6 +39,19 @@ def get_conn() -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON;")
     return conn
+
+
+def ensure_column(
+    conn: sqlite3.Connection, table: str, column: str, definition: str
+) -> None:
+    columns = {
+        row["name"]
+        for row in conn.execute(f"PRAGMA table_info({table});").fetchall()
+    }
+    if column not in columns:
+        conn.execute(
+            f"ALTER TABLE {table} ADD COLUMN {column} {definition};"
+        )
 
 
 def init_db() -> None:
@@ -50,6 +75,10 @@ def init_db() -> None:
                 created_at TEXT NOT NULL,
                 status TEXT NOT NULL,
                 winner_id INTEGER,
+                reward_type TEXT,
+                reward_value TEXT,
+                reward_set_by INTEGER,
+                reward_set_at TEXT,
                 closed_at TEXT
             );
             """
@@ -65,6 +94,10 @@ def init_db() -> None:
             );
             """
         )
+        ensure_column(conn, "giveaways", "reward_type", "TEXT")
+        ensure_column(conn, "giveaways", "reward_value", "TEXT")
+        ensure_column(conn, "giveaways", "reward_set_by", "INTEGER")
+        ensure_column(conn, "giveaways", "reward_set_at", "TEXT")
 
 
 def ensure_owner_admin() -> None:
@@ -102,6 +135,39 @@ def parse_giveaway_id(args: list[str]) -> int | None:
     if not args:
         return None
     return parse_user_id(args[0])
+
+
+def normalize_reward_type(value: str) -> str | None:
+    if not value:
+        return None
+    return REWARD_TYPE_ALIASES.get(value.strip().lower())
+
+
+def parse_reward_args(args: list[str]) -> tuple[int, str, str] | None:
+    if len(args) < 3:
+        return None
+    giveaway_id = parse_user_id(args[0])
+    if giveaway_id is None:
+        return None
+    reward_type = normalize_reward_type(args[1])
+    if reward_type is None:
+        return None
+    reward_value = " ".join(args[2:]).strip()
+    if not reward_value:
+        return None
+    return giveaway_id, reward_type, reward_value
+
+
+def reward_label(reward_type: str | None) -> str:
+    if reward_type == "mailpass":
+        return "Mail:pass"
+    if reward_type == "redeemcode":
+        return "Redeem code"
+    return "Reward"
+
+
+def reward_description(row: sqlite3.Row) -> str:
+    return f"{reward_label(row['reward_type'])}: {row['reward_value']}"
 
 
 def require_admin(update: Update) -> bool:
@@ -149,11 +215,14 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/listgiveaways - List recent giveaways\n"
         "/giveaway <id> - View giveaway details\n"
         "/join <id> - Join an open giveaway\n"
+        "/claim <id> - Claim reward if you won\n"
         "/admins - List current admins\n"
         "\nAdmin commands:\n"
         "/creategiveaway Title | Description\n"
         "/closegiveaway <id>\n"
         "/winner <id> [reroll]\n"
+        "/setreward <id> <mailpass|redeemcode|custom> <value>\n"
+        "/reward <id>\n"
         "/addadmin <user_id> (or reply to a user)\n"
         "/removeadmin <user_id> (or reply to a user)"
     )
@@ -290,16 +359,30 @@ async def giveaway_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if row is None:
         await update.message.reply_text("Giveaway not found.")
         return
+    user = update.effective_user
+    user_id = user.id if user else None
+    is_admin_user = user_id is not None and is_admin(user_id)
+    is_winner_user = user_id is not None and row["winner_id"] == user_id
     status = row["status"].upper()
     winner = str(row["winner_id"]) if row["winner_id"] else "Not selected"
     description = row["description"] or "No description."
+    if row["reward_value"]:
+        if is_admin_user:
+            reward_line = f"Reward: {reward_description(row)}"
+        else:
+            reward_line = "Reward: Set (ask admin)"
+    else:
+        reward_line = "Reward: Not set"
     response = (
         f"Giveaway #{row['id']} - {row['title']}\n"
         f"Status: {status}\n"
         f"Participants: {row['participants']}\n"
         f"Winner: {winner}\n"
+        f"{reward_line}\n"
         f"Description: {description}"
     )
+    if is_winner_user and row["reward_value"]:
+        response = f"{response}\nUse /claim {row['id']} to receive your reward."
     await update.message.reply_text(response)
 
 
@@ -366,6 +449,136 @@ async def close_giveaway(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await update.message.reply_text(f"Giveaway #{giveaway_id} closed.")
 
 
+async def set_reward(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not require_admin(update):
+        await update.message.reply_text("Only admins can set rewards.")
+        return
+    parsed = parse_reward_args(context.args)
+    if parsed is None:
+        await update.message.reply_text(
+            "Usage: /setreward <id> <mailpass|redeemcode|custom> <value>"
+        )
+        return
+    giveaway_id, reward_type, reward_value = parsed
+    if reward_type == "mailpass" and ":" not in reward_value:
+        await update.message.reply_text(
+            "Mail:pass should look like email:password."
+        )
+        return
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT id FROM giveaways WHERE id = ?;",
+            (giveaway_id,),
+        ).fetchone()
+        if row is None:
+            await update.message.reply_text("Giveaway not found.")
+            return
+        conn.execute(
+            """
+            UPDATE giveaways
+            SET reward_type = ?,
+                reward_value = ?,
+                reward_set_by = ?,
+                reward_set_at = ?
+            WHERE id = ?;
+            """,
+            (
+                reward_type,
+                reward_value,
+                update.effective_user.id,
+                utc_now(),
+                giveaway_id,
+            ),
+        )
+    await update.message.reply_text(
+        f"Reward set for giveaway #{giveaway_id}: {reward_label(reward_type)}"
+    )
+
+
+async def reward_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not require_admin(update):
+        await update.message.reply_text("Only admins can view rewards.")
+        return
+    giveaway_id = parse_giveaway_id(context.args)
+    if giveaway_id is None:
+        await update.message.reply_text("Usage: /reward <id>")
+        return
+    row = fetch_giveaway(giveaway_id)
+    if row is None:
+        await update.message.reply_text("Giveaway not found.")
+        return
+    if not row["reward_value"]:
+        await update.message.reply_text("No reward set for this giveaway.")
+        return
+    lines = [
+        f"Giveaway #{row['id']} reward:",
+        reward_description(row),
+    ]
+    if row["reward_set_by"] and row["reward_set_at"]:
+        lines.append(
+            f"Set by {row['reward_set_by']} on {row['reward_set_at']}"
+        )
+    await update.message.reply_text("\n".join(lines))
+
+
+async def claim_reward(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    giveaway_id = parse_giveaway_id(context.args)
+    if giveaway_id is None:
+        await update.message.reply_text("Usage: /claim <id>")
+        return
+    row = fetch_giveaway(giveaway_id)
+    if row is None:
+        await update.message.reply_text("Giveaway not found.")
+        return
+    user = update.effective_user
+    if user is None:
+        await update.message.reply_text("Could not identify user.")
+        return
+    if row["winner_id"] is None:
+        await update.message.reply_text("Winner not selected yet.")
+        return
+    if row["winner_id"] != user.id:
+        await update.message.reply_text("Only the winner can claim this reward.")
+        return
+    if not row["reward_value"]:
+        await update.message.reply_text("Reward not set yet.")
+        return
+    chat = update.effective_chat
+    is_private = chat is not None and chat.type == "private"
+    reward_message = (
+        f"Reward for giveaway #{row['id']} - {row['title']}:\n"
+        f"{reward_description(row)}"
+    )
+    if is_private:
+        await update.message.reply_text(reward_message)
+        return
+    sent = await send_reward_message(context, user.id, row)
+    if sent:
+        await update.message.reply_text(
+            "I sent your reward in a private message."
+        )
+    else:
+        await update.message.reply_text(
+            "I could not send you a private message. Start the bot in a "
+            "private chat and try /claim again."
+        )
+
+
+async def send_reward_message(
+    context: ContextTypes.DEFAULT_TYPE, user_id: int, row: sqlite3.Row
+) -> bool:
+    message = (
+        f"Reward for giveaway #{row['id']} - {row['title']}:\n"
+        f"{reward_description(row)}"
+    )
+    try:
+        await context.bot.send_message(chat_id=user_id, text=message)
+        return True
+    except TelegramError:
+        LOGGER.warning("Failed to send reward to user %s", user_id)
+        return False
+
+
 async def pick_winner(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not require_admin(update):
         await update.message.reply_text("Only admins can pick winners.")
@@ -399,8 +612,17 @@ async def pick_winner(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             "UPDATE giveaways SET winner_id = ? WHERE id = ?;",
             (winner_id, giveaway_id),
         )
+    reward_note = " Reward not set."
+    if row["reward_value"]:
+        sent = await send_reward_message(context, winner_id, row)
+        if sent:
+            reward_note = " Reward sent via private message."
+        else:
+            reward_note = (
+                " Could not DM reward. Ask the winner to /claim."
+            )
     await update.message.reply_text(
-        f"Winner for giveaway #{giveaway_id}: {winner_id}"
+        f"Winner for giveaway #{giveaway_id}: {winner_id}.{reward_note}"
     )
 
 
@@ -427,7 +649,10 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("listgiveaways", list_giveaways))
     application.add_handler(CommandHandler("giveaway", giveaway_info))
     application.add_handler(CommandHandler("join", join_giveaway))
+    application.add_handler(CommandHandler("claim", claim_reward))
     application.add_handler(CommandHandler("closegiveaway", close_giveaway))
+    application.add_handler(CommandHandler("setreward", set_reward))
+    application.add_handler(CommandHandler("reward", reward_command))
     application.add_handler(CommandHandler("winner", pick_winner))
     application.add_error_handler(error_handler)
     return application
