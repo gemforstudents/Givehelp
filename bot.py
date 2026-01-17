@@ -1,12 +1,22 @@
 import logging
 import os
 import random
+import secrets
+import string
 import sqlite3
 from datetime import datetime, timedelta, timezone
 
 from telegram import Update
 from telegram.error import TelegramError
-from telegram.ext import Application, ApplicationBuilder, CommandHandler, ContextTypes
+from telegram.ext import (
+    Application,
+    ApplicationBuilder,
+    CommandHandler,
+    ContextTypes,
+    ConversationHandler,
+    MessageHandler,
+    filters,
+)
 
 DB_PATH = os.getenv("DB_PATH", "giveaway.db")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
@@ -28,6 +38,28 @@ REWARD_TYPE_ALIASES = {
     "custom": "custom",
     "text": "custom",
 }
+
+(
+    CREATE_TITLE,
+    CREATE_DESCRIPTION,
+    CREATE_MODE,
+    CREATE_COUNT,
+    CREATE_REWARD_TYPE,
+    CREATE_REWARD_VALUE,
+) = range(6)
+
+MODE_ALIASES = {
+    "random": "random",
+    "winner": "random",
+    "winners": "random",
+    "redeem": "redeem",
+    "redeemcode": "redeem",
+    "code": "redeem",
+}
+
+MAX_WINNERS = 50
+MAX_CODES = 200
+CODE_LENGTH = 12
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -106,6 +138,9 @@ def init_db() -> None:
                 created_at TEXT NOT NULL,
                 status TEXT NOT NULL,
                 winner_id INTEGER,
+                mode TEXT,
+                winner_count INTEGER,
+                code_count INTEGER,
                 reward_type TEXT,
                 reward_value TEXT,
                 reward_set_by INTEGER,
@@ -151,6 +186,20 @@ def init_db() -> None:
             );
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS giveaway_winners (
+                giveaway_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                selected_at TEXT NOT NULL,
+                PRIMARY KEY (giveaway_id, user_id),
+                FOREIGN KEY (giveaway_id) REFERENCES giveaways(id) ON DELETE CASCADE
+            );
+            """
+        )
+        ensure_column(conn, "giveaways", "mode", "TEXT")
+        ensure_column(conn, "giveaways", "winner_count", "INTEGER")
+        ensure_column(conn, "giveaways", "code_count", "INTEGER")
         ensure_column(conn, "giveaways", "reward_type", "TEXT")
         ensure_column(conn, "giveaways", "reward_value", "TEXT")
         ensure_column(conn, "giveaways", "reward_set_by", "INTEGER")
@@ -253,6 +302,49 @@ def parse_codes_payload(args: list[str]) -> tuple[int, list[str]] | None:
     return giveaway_id, codes
 
 
+def normalize_mode(value: str) -> str | None:
+    if not value:
+        return None
+    return MODE_ALIASES.get(value.strip().lower())
+
+
+def parse_positive_int(value: str) -> int | None:
+    text = value.strip()
+    if not text.isdigit():
+        return None
+    number = int(text)
+    if number <= 0:
+        return None
+    return number
+
+
+def generate_codes(count: int) -> list[str]:
+    alphabet = string.ascii_uppercase + string.digits
+    codes: set[str] = set()
+    while len(codes) < count:
+        code = "".join(secrets.choice(alphabet) for _ in range(CODE_LENGTH))
+        codes.add(code)
+    return sorted(codes)
+
+
+def chunk_lines(lines: list[str], max_len: int = 3500) -> list[str]:
+    chunks: list[str] = []
+    current: list[str] = []
+    length = 0
+    for line in lines:
+        extra = len(line) + (1 if current else 0)
+        if current and length + extra > max_len:
+            chunks.append("\n".join(current))
+            current = [line]
+            length = len(line)
+        else:
+            current.append(line)
+            length += extra
+    if current:
+        chunks.append("\n".join(current))
+    return chunks
+
+
 def reward_label(reward_type: str | None) -> str:
     if reward_type == "mailpass":
         return "Mail:pass"
@@ -263,6 +355,67 @@ def reward_label(reward_type: str | None) -> str:
 
 def reward_description(row: sqlite3.Row) -> str:
     return f"{reward_label(row['reward_type'])}: {row['reward_value']}"
+
+
+def get_winner_ids(giveaway_id: int) -> list[int]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT user_id
+            FROM giveaway_winners
+            WHERE giveaway_id = ?
+            ORDER BY selected_at ASC;
+            """,
+            (giveaway_id,),
+        ).fetchall()
+        if rows:
+            return [row["user_id"] for row in rows]
+        row = conn.execute(
+            "SELECT winner_id FROM giveaways WHERE id = ?;",
+            (giveaway_id,),
+        ).fetchone()
+        if row and row["winner_id"]:
+            return [row["winner_id"]]
+    return []
+
+
+def winners_count(giveaway_id: int) -> int:
+    return len(get_winner_ids(giveaway_id))
+
+
+def is_winner(giveaway_id: int, user_id: int) -> bool:
+    return user_id in get_winner_ids(giveaway_id)
+
+
+def clear_winners(giveaway_id: int) -> None:
+    with get_conn() as conn:
+        conn.execute(
+            "DELETE FROM giveaway_winners WHERE giveaway_id = ?;",
+            (giveaway_id,),
+        )
+        conn.execute(
+            "UPDATE giveaways SET winner_id = NULL WHERE id = ?;",
+            (giveaway_id,),
+        )
+
+
+def insert_winners(giveaway_id: int, winner_ids: list[int]) -> None:
+    timestamp = utc_now()
+    with get_conn() as conn:
+        for user_id in winner_ids:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO giveaway_winners
+                    (giveaway_id, user_id, selected_at)
+                VALUES (?, ?, ?);
+                """,
+                (giveaway_id, user_id, timestamp),
+            )
+        if winner_ids:
+            conn.execute(
+                "UPDATE giveaways SET winner_id = ? WHERE id = ?;",
+                (winner_ids[0], giveaway_id),
+            )
 
 
 def fetch_redeem_stats(giveaway_id: int) -> tuple[int, int]:
@@ -542,8 +695,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/claim <id> - Claim reward if you won\n"
         "/redeem <id> <code> - Redeem a code for a reward\n"
         "/admins - List current admins\n"
+        "/cancel - Cancel the current action\n"
         "\nAdmin commands:\n"
-        "/creategiveaway Title | Description\n"
+        "/creategiveaway - Guided giveaway setup\n"
+        "/create - Alias for /creategiveaway\n"
         "/closegiveaway <id>\n"
         "/winner <id> [reroll]\n"
         "/setreward <id> <mailpass|redeemcode|custom> <value>\n"
@@ -636,37 +791,221 @@ async def remove_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text(f"Removed admin: {target_id}")
 
 
-async def create_giveaway(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def create_giveaway_start(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
     if not await enforce_access(update, context):
-        return
+        return ConversationHandler.END
     if not require_admin(update):
         await update.message.reply_text("Only admins can create giveaways.")
-        return
-    payload = " ".join(context.args).strip()
-    if "|" not in payload:
-        await update.message.reply_text(
-            "Usage: /creategiveaway Title | Description"
-        )
-        return
-    title, description = [part.strip() for part in payload.split("|", 1)]
+        return ConversationHandler.END
+    context.user_data["create_giveaway"] = {}
+    await update.message.reply_text(
+        "Send the giveaway title. Use /cancel to stop."
+    )
+    return CREATE_TITLE
+
+
+async def create_giveaway_title(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    if not await enforce_access(update, context):
+        return ConversationHandler.END
+    title = (update.message.text or "").strip()
     if not title:
-        await update.message.reply_text("Title cannot be empty.")
-        return
+        await update.message.reply_text("Title cannot be empty. Send a title.")
+        return CREATE_TITLE
+    context.user_data["create_giveaway"]["title"] = title
+    await update.message.reply_text(
+        "Send a short description, or type 'skip' to leave it empty."
+    )
+    return CREATE_DESCRIPTION
+
+
+async def create_giveaway_description(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    if not await enforce_access(update, context):
+        return ConversationHandler.END
+    text = (update.message.text or "").strip()
+    description = "" if text.lower() in {"skip", "none", "-"} else text
+    context.user_data["create_giveaway"]["description"] = description
+    await update.message.reply_text(
+        "Choose giveaway type: 'random' for random winners or "
+        "'redeem' for redeem-code based."
+    )
+    return CREATE_MODE
+
+
+async def create_giveaway_mode(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    if not await enforce_access(update, context):
+        return ConversationHandler.END
+    mode = normalize_mode(update.message.text or "")
+    if mode is None:
+        await update.message.reply_text(
+            "Invalid mode. Reply with 'random' or 'redeem'."
+        )
+        return CREATE_MODE
+    context.user_data["create_giveaway"]["mode"] = mode
+    if mode == "random":
+        await update.message.reply_text(
+            f"How many winners? (1-{MAX_WINNERS})"
+        )
+    else:
+        await update.message.reply_text(
+            f"How many redeem codes to generate? (1-{MAX_CODES})"
+        )
+    return CREATE_COUNT
+
+
+async def create_giveaway_count(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    if not await enforce_access(update, context):
+        return ConversationHandler.END
+    mode = context.user_data["create_giveaway"].get("mode")
+    count = parse_positive_int(update.message.text or "")
+    if count is None:
+        await update.message.reply_text("Send a positive whole number.")
+        return CREATE_COUNT
+    if mode == "random" and count > MAX_WINNERS:
+        await update.message.reply_text(
+            f"Max winners is {MAX_WINNERS}. Send a smaller number."
+        )
+        return CREATE_COUNT
+    if mode == "redeem" and count > MAX_CODES:
+        await update.message.reply_text(
+            f"Max codes is {MAX_CODES}. Send a smaller number."
+        )
+        return CREATE_COUNT
+    if mode == "random":
+        context.user_data["create_giveaway"]["winner_count"] = count
+    else:
+        context.user_data["create_giveaway"]["code_count"] = count
+    await update.message.reply_text(
+        "Choose reward type: mailpass, redeemcode, or custom."
+    )
+    return CREATE_REWARD_TYPE
+
+
+async def create_giveaway_reward_type(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    if not await enforce_access(update, context):
+        return ConversationHandler.END
+    reward_type = normalize_reward_type(update.message.text or "")
+    if reward_type is None:
+        await update.message.reply_text(
+            "Invalid reward type. Use mailpass, redeemcode, or custom."
+        )
+        return CREATE_REWARD_TYPE
+    context.user_data["create_giveaway"]["reward_type"] = reward_type
+    await update.message.reply_text(
+        "Send the reward value (example for mailpass: email:password)."
+    )
+    return CREATE_REWARD_VALUE
+
+
+async def create_giveaway_reward_value(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    if not await enforce_access(update, context):
+        return ConversationHandler.END
+    payload = (update.message.text or "").strip()
+    data = context.user_data.get("create_giveaway", {})
+    reward_type = data.get("reward_type")
+    if reward_type == "mailpass" and ":" not in payload:
+        await update.message.reply_text(
+            "Mail:pass must look like email:password."
+        )
+        return CREATE_REWARD_VALUE
+    if not payload:
+        await update.message.reply_text("Reward cannot be empty.")
+        return CREATE_REWARD_VALUE
+    data["reward_value"] = payload
+    mode = data.get("mode") or "random"
+    title = data.get("title", "Giveaway")
+    description = data.get("description", "")
+    winner_count = data.get("winner_count")
+    code_count = data.get("code_count")
+    if mode == "random" and not winner_count:
+        await update.message.reply_text(
+            "Winner count missing. Please restart /creategiveaway."
+        )
+        context.user_data.pop("create_giveaway", None)
+        return ConversationHandler.END
+    if mode == "redeem" and not code_count:
+        await update.message.reply_text(
+            "Code count missing. Please restart /creategiveaway."
+        )
+        context.user_data.pop("create_giveaway", None)
+        return ConversationHandler.END
     with get_conn() as conn:
         cursor = conn.execute(
             """
             INSERT INTO giveaways
-                (title, description, created_by, created_at, status)
-            VALUES (?, ?, ?, ?, 'open');
+                (title, description, created_by, created_at, status, mode,
+                 winner_count, code_count, reward_type, reward_value,
+                 reward_set_by, reward_set_at)
+            VALUES (?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?);
             """,
-            (title, description, update.effective_user.id, utc_now()),
+            (
+                title,
+                description,
+                update.effective_user.id,
+                utc_now(),
+                mode,
+                winner_count,
+                code_count,
+                reward_type,
+                payload,
+                update.effective_user.id,
+                utc_now(),
+            ),
         )
         giveaway_id = cursor.lastrowid
-    await update.message.reply_text(
-        f"Giveaway created: #{giveaway_id}\n"
-        f"Title: {title}\n"
-        f"Share /join {giveaway_id} to let users join."
-    )
+    summary = [
+        f"Giveaway created: #{giveaway_id}",
+        f"Title: {title}",
+        f"Mode: {'Random winners' if mode == 'random' else 'Redeem codes'}",
+        f"Reward: {reward_label(reward_type)}",
+    ]
+    if mode == "random":
+        summary.append(f"Winners: {winner_count}")
+        summary.append(f"Use /winner {giveaway_id} to select winners.")
+    else:
+        codes = generate_codes(code_count or 0)
+        with get_conn() as conn:
+            for code in codes:
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO redeem_codes
+                        (giveaway_id, code, added_by, added_at)
+                    VALUES (?, ?, ?, ?);
+                    """,
+                    (giveaway_id, code, update.effective_user.id, utc_now()),
+                )
+        summary.append(f"Codes generated: {len(codes)}")
+        summary.append(f"Users redeem via /redeem {giveaway_id} <code>.")
+        await update.message.reply_text("\n".join(summary))
+        if codes:
+            await send_redeem_codes(update, context, giveaway_id, codes)
+        context.user_data.pop("create_giveaway", None)
+        return ConversationHandler.END
+    summary.append(f"Share /join {giveaway_id} to let users join.")
+    await update.message.reply_text("\n".join(summary))
+    context.user_data.pop("create_giveaway", None)
+    return ConversationHandler.END
+
+
+async def cancel_create_giveaway(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    context.user_data.pop("create_giveaway", None)
+    await update.message.reply_text("Giveaway creation canceled.")
+    return ConversationHandler.END
 
 
 async def list_giveaways(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -703,11 +1042,14 @@ async def giveaway_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     user = update.effective_user
     user_id = user.id if user else None
     is_admin_user = user_id is not None and is_admin(user_id)
-    is_winner_user = user_id is not None and row["winner_id"] == user_id
+    is_winner_user = user_id is not None and is_winner(giveaway_id, user_id)
     status = row["status"].upper()
-    winner = str(row["winner_id"]) if row["winner_id"] else "Not selected"
     description = row["description"] or "No description."
-    redeem_total, redeem_claimed = fetch_redeem_stats(giveaway_id)
+    mode = row["mode"] or "random"
+    mode_label = "Random winners" if mode == "random" else "Redeem codes"
+    redeem_total, redeem_claimed = (
+        fetch_redeem_stats(giveaway_id) if mode == "redeem" else (0, 0)
+    )
     if row["reward_value"]:
         if is_admin_user:
             reward_line = f"Reward: {reward_description(row)}"
@@ -715,20 +1057,31 @@ async def giveaway_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             reward_line = "Reward: Set (ask admin)"
     else:
         reward_line = "Reward: Not set"
-    if redeem_total:
-        if is_admin_user:
-            redeem_line = (
-                f"Redeem codes: {redeem_total} total, {redeem_claimed} claimed"
-            )
-        else:
-            redeem_line = "Redeem codes: Required"
-    else:
+    if mode == "random":
+        total_winners = row["winner_count"] or 1
+        selected_winners = winners_count(giveaway_id)
+        winners_line = f"Winners: {selected_winners}/{total_winners}"
+        if is_admin_user and selected_winners:
+            winners_ids = ", ".join(map(str, get_winner_ids(giveaway_id)))
+            winners_line += f" (ids: {winners_ids})"
         redeem_line = "Redeem codes: None"
+    else:
+        winners_line = "Winners: redeem via code"
+        if redeem_total:
+            if is_admin_user:
+                redeem_line = (
+                    f"Redeem codes: {redeem_total} total, {redeem_claimed} claimed"
+                )
+            else:
+                redeem_line = "Redeem codes: Required"
+        else:
+            redeem_line = "Redeem codes: None"
     response = (
         f"Giveaway #{row['id']} - {row['title']}\n"
         f"Status: {status}\n"
+        f"Mode: {mode_label}\n"
         f"Participants: {row['participants']}\n"
-        f"Winner: {winner}\n"
+        f"{winners_line}\n"
         f"{reward_line}\n"
         f"{redeem_line}\n"
         f"Description: {description}"
@@ -864,14 +1217,16 @@ async def add_code(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("Usage: /addcode <id> <code>")
         return
     giveaway_id, code = parsed
+    row = fetch_giveaway(giveaway_id)
+    if row is None:
+        await update.message.reply_text("Giveaway not found.")
+        return
+    if (row["mode"] or "random") != "redeem":
+        await update.message.reply_text(
+            "This giveaway uses random winners and does not accept codes."
+        )
+        return
     with get_conn() as conn:
-        row = conn.execute(
-            "SELECT id FROM giveaways WHERE id = ?;",
-            (giveaway_id,),
-        ).fetchone()
-        if row is None:
-            await update.message.reply_text("Giveaway not found.")
-            return
         cursor = conn.execute(
             """
             INSERT OR IGNORE INTO redeem_codes
@@ -901,14 +1256,16 @@ async def add_codes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
     giveaway_id, codes = parsed
+    row = fetch_giveaway(giveaway_id)
+    if row is None:
+        await update.message.reply_text("Giveaway not found.")
+        return
+    if (row["mode"] or "random") != "redeem":
+        await update.message.reply_text(
+            "This giveaway uses random winners and does not accept codes."
+        )
+        return
     with get_conn() as conn:
-        row = conn.execute(
-            "SELECT id FROM giveaways WHERE id = ?;",
-            (giveaway_id,),
-        ).fetchone()
-        if row is None:
-            await update.message.reply_text("Giveaway not found.")
-            return
         added = 0
         for code in codes:
             cursor = conn.execute(
@@ -939,6 +1296,11 @@ async def codes_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     row = fetch_giveaway(giveaway_id)
     if row is None:
         await update.message.reply_text("Giveaway not found.")
+        return
+    if (row["mode"] or "random") != "redeem":
+        await update.message.reply_text(
+            "This giveaway uses random winners and has no redeem codes."
+        )
         return
     total, claimed = fetch_redeem_stats(giveaway_id)
     if total == 0:
@@ -979,6 +1341,53 @@ async def reward_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await update.message.reply_text("\n".join(lines))
 
 
+async def send_codes_to_chat(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    giveaway_id: int,
+    codes: list[str],
+) -> bool:
+    chunks = chunk_lines(codes)
+    try:
+        for index, chunk in enumerate(chunks, start=1):
+            header = f"Redeem codes for giveaway #{giveaway_id}"
+            if len(chunks) > 1:
+                header = f"{header} (part {index}/{len(chunks)})"
+            await context.bot.send_message(
+                chat_id=chat_id, text=f"{header}:\n{chunk}"
+            )
+        return True
+    except TelegramError:
+        LOGGER.warning("Failed to send redeem codes to %s", chat_id)
+        return False
+
+
+async def send_redeem_codes(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    giveaway_id: int,
+    codes: list[str],
+) -> None:
+    user = update.effective_user
+    chat = update.effective_chat
+    if user is None or chat is None:
+        return
+    target_chat_id = user.id
+    if chat.type == "private":
+        await send_codes_to_chat(context, target_chat_id, giveaway_id, codes)
+        return
+    sent = await send_codes_to_chat(context, target_chat_id, giveaway_id, codes)
+    if sent:
+        await update.message.reply_text(
+            "Redeem codes sent in a private message."
+        )
+        return
+    await update.message.reply_text(
+        "I could not DM you the codes, sending them here."
+    )
+    await send_codes_to_chat(context, chat.id, giveaway_id, codes)
+
+
 async def unban_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await enforce_access(update, context):
         return
@@ -1006,6 +1415,11 @@ async def redeem_code(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     row = fetch_giveaway(giveaway_id)
     if row is None:
         await update.message.reply_text("Giveaway not found.")
+        return
+    if (row["mode"] or "random") != "redeem":
+        await update.message.reply_text(
+            "This giveaway uses random winners. No redeem codes are required."
+        )
         return
     if not row["reward_value"]:
         await update.message.reply_text("Reward not set yet.")
@@ -1078,11 +1492,12 @@ async def claim_reward(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text("Could not identify user.")
         return
     has_redeemed = user_has_redeemed(giveaway_id, user.id)
-    if row["winner_id"] is None and not has_redeemed:
+    winner_ids = get_winner_ids(giveaway_id)
+    if not winner_ids and not has_redeemed:
         await update.message.reply_text("Winner not selected yet.")
         return
-    is_winner = row["winner_id"] == user.id if row["winner_id"] else False
-    if not (is_winner or has_redeemed):
+    is_winner_user = user.id in winner_ids
+    if not (is_winner_user or has_redeemed):
         await update.message.reply_text(
             "Only the winner or a redeemed-code user can claim this reward."
         )
@@ -1141,12 +1556,20 @@ async def pick_winner(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if row is None:
         await update.message.reply_text("Giveaway not found.")
         return
-    if row["winner_id"] and not reroll:
+    mode = row["mode"] or "random"
+    if mode != "random":
         await update.message.reply_text(
-            f"Winner already selected: {row['winner_id']}. "
-            "Add 'reroll' to pick again."
+            "This giveaway uses redeem codes. Winners are set by redeeming."
         )
         return
+    existing_winners = get_winner_ids(giveaway_id)
+    if existing_winners and not reroll:
+        await update.message.reply_text(
+            "Winners already selected. Add 'reroll' to pick again."
+        )
+        return
+    if reroll:
+        clear_winners(giveaway_id)
     with get_conn() as conn:
         participants = conn.execute(
             "SELECT user_id FROM participants WHERE giveaway_id = ?;",
@@ -1155,23 +1578,32 @@ async def pick_winner(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not participants:
         await update.message.reply_text("No participants yet.")
         return
-    winner_id = random.choice([row["user_id"] for row in participants])
-    with get_conn() as conn:
-        conn.execute(
-            "UPDATE giveaways SET winner_id = ? WHERE id = ?;",
-            (winner_id, giveaway_id),
+    winner_total = row["winner_count"] or 1
+    participant_ids = [entry["user_id"] for entry in participants]
+    if len(participant_ids) < winner_total:
+        await update.message.reply_text(
+            f"Not enough participants for {winner_total} winners."
         )
+        return
+    winner_ids = random.sample(participant_ids, k=winner_total)
+    insert_winners(giveaway_id, winner_ids)
     reward_note = " Reward not set."
+    delivered = 0
     if row["reward_value"]:
-        sent = await send_reward_message(context, winner_id, row)
-        if sent:
+        for winner_id in winner_ids:
+            sent = await send_reward_message(context, winner_id, row)
+            if sent:
+                delivered += 1
+        if delivered == len(winner_ids):
             reward_note = " Reward sent via private message."
         else:
             reward_note = (
-                " Could not DM reward. Ask the winner to /claim."
+                f" Reward sent to {delivered}/{len(winner_ids)} winners. "
+                "Ask others to /claim."
             )
+    winners_list = ", ".join(map(str, winner_ids))
     await update.message.reply_text(
-        f"Winner for giveaway #{giveaway_id}: {winner_id}.{reward_note}"
+        f"Winners for giveaway #{giveaway_id}: {winners_list}.{reward_note}"
     )
 
 
@@ -1189,12 +1621,45 @@ def build_application() -> Application:
     init_db()
     ensure_owner_admin()
     application = ApplicationBuilder().token(BOT_TOKEN).build()
+    create_giveaway_flow = ConversationHandler(
+        entry_points=[
+            CommandHandler("creategiveaway", create_giveaway_start),
+            CommandHandler("create", create_giveaway_start),
+        ],
+        states={
+            CREATE_TITLE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, create_giveaway_title)
+            ],
+            CREATE_DESCRIPTION: [
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND, create_giveaway_description
+                )
+            ],
+            CREATE_MODE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, create_giveaway_mode)
+            ],
+            CREATE_COUNT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, create_giveaway_count)
+            ],
+            CREATE_REWARD_TYPE: [
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND, create_giveaway_reward_type
+                )
+            ],
+            CREATE_REWARD_VALUE: [
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND, create_giveaway_reward_value
+                )
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_create_giveaway)],
+    )
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("admins", admins_command))
     application.add_handler(CommandHandler("addadmin", add_admin))
     application.add_handler(CommandHandler("removeadmin", remove_admin))
-    application.add_handler(CommandHandler("creategiveaway", create_giveaway))
+    application.add_handler(create_giveaway_flow)
     application.add_handler(CommandHandler("listgiveaways", list_giveaways))
     application.add_handler(CommandHandler("giveaway", giveaway_info))
     application.add_handler(CommandHandler("join", join_giveaway))

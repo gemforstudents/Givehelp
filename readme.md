@@ -10,6 +10,7 @@ giveaways while trusted admins can add other admins.
 - Random winner selection with optional reroll
 - Reward support for redeem codes and mail:pass credentials
 - Redeem codes that unlock the stored reward
+- Guided giveaway creation with automatic code generation
 - SQLite persistence for admins, giveaways, and entries
 
 ## Requirements
@@ -42,9 +43,11 @@ General:
 - `/claim <id>` - Claim reward if you won
 - `/redeem <id> <code>` - Redeem a code for reward
 - `/admins` - List admins
+- `/cancel` - Cancel the current action
 
 Admin only:
-- `/creategiveaway Title | Description`
+- `/creategiveaway` - Guided giveaway setup
+- `/create` - Alias for `/creategiveaway`
 - `/closegiveaway <id>`
 - `/winner <id> [reroll]`
 - `/setreward <id> <mailpass|redeemcode|custom> <value>`
@@ -60,6 +63,7 @@ Admin only:
 - The owner id provided in `OWNER_ID` is automatically an admin.
 - The database file is created in the working directory (default: `giveaway.db`).
 - Rewards and redeem codes are stored in plaintext in SQLite, so keep access restricted.
+- `/creategiveaway` walks admins through winner type, count, and rewards.
 - Users must remain in the required channel(s). Leaving triggers a temporary ban,
   and repeat violations cause a permanent ban until an admin uses `/unban`.
 - For private channels, add the bot to the channel and allow it to read members.
